@@ -83,6 +83,18 @@ struct Params {
     static constexpr int  LEAD_LAG_LATENCY_SAFETY_MS = 50;
     // Default co-location. Override at runtime: LOC=NYSE ./bot (NYSE/ZSE/HKEX).
     static constexpr const char* OUR_LOCATION = "ZSE";
+
+    // ─── Cross-venue same-ticker arbitrage (xvenue) ─────────────────
+    // Buy ticker on cheaper venue, sell on richer venue. Pure hedged
+    // arbitrage (long+short same ticker). Only safe for near-pairs
+    // where both legs fit inside an MM update window.
+    // Edge requirement: bid_richer - ask_cheaper >= XVENUE_EDGE_CENTS
+    static constexpr int  XVENUE_EDGE_CENTS    = 5;   // free since no fees
+    static constexpr int  XVENUE_SIZE          = 20;
+    static constexpr int  XVENUE_POS_CAP       = 80;
+    static constexpr int  XVENUE_COOLDOWN_MS   = 200; // per pair+ticker
+    static constexpr int  XVENUE_SAFETY_MS     = 60;  // tighter than lead-lag
+    static constexpr int  XVENUE_MAX_PAIR_RTT  = 30;  // only try pairs ≤30ms RTT
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -288,12 +300,82 @@ inline bool latency_ok(const std::string& our_loc,
     return (t_see + t_send + safety_ms) < lag_ms;
 }
 
+// ─── Auto co-location detection ────────────────────────────────────
+// Per-exchange running average of (local_recv_ms - server_time_ms).
+// The clocks may differ by an arbitrary offset, but the RELATIVE
+// difference between exchanges still reveals which one is closest.
+// Smallest measured one-way delay = our co-location.
+struct LatencyTracker {
+    std::mutex mtx;
+    std::unordered_map<std::string,double> ema_one_way;  // ms (relative)
+    std::unordered_map<std::string,int>    samples;
+    std::string detected_loc;       // empty until enough samples
+    int64_t locked_at_ms = 0;
+
+    void record(const std::string& exch, int64_t local_ms, int64_t server_ms) {
+        if (server_ms <= 0) return;
+        double oneway = (double)(local_ms - server_ms);
+        std::lock_guard lk(mtx);
+        auto& e = ema_one_way[exch];
+        int& n = samples[exch];
+        // EMA with α=0.1, init to first sample
+        if (n == 0) e = oneway; else e = 0.9*e + 0.1*oneway;
+        ++n;
+    }
+
+    // Returns "" until we've seen ≥30 samples from ≥7 venues.
+    std::string snapshot_best() {
+        std::lock_guard lk(mtx);
+        if (!detected_loc.empty()) return detected_loc;
+        int ready = 0;
+        for (auto& [_, n] : samples) if (n >= 30) ++ready;
+        if (ready < 7) return "";
+        std::string best;
+        double best_v = 1e18;
+        for (auto& [exch, v] : ema_one_way) {
+            if (samples[exch] < 30) continue;
+            if (v < best_v) { best_v = v; best = exch; }
+        }
+        if (!best.empty()) {
+            detected_loc = best;
+            locked_at_ms = local_now_unsafe();
+        }
+        return detected_loc;
+    }
+private:
+    static int64_t local_now_unsafe() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+};
+
+inline LatencyTracker& latency_tracker() {
+    static LatencyTracker t;
+    return t;
+}
+
 inline const std::string& our_location() {
-    static std::string loc = []{
-        const char* e = std::getenv("LOC");
-        return std::string(e && *e ? e : Params::OUR_LOCATION);
-    }();
-    return loc;
+    static std::string fallback;
+    static std::mutex mtx;
+    // Manual override always wins (for testing).
+    if (const char* e = std::getenv("LOC"); e && *e) {
+        static std::string forced(e);
+        return forced;
+    }
+    // Otherwise auto-detect from latency tracker.
+    auto best = latency_tracker().snapshot_best();
+    if (!best.empty()) {
+        std::lock_guard lk(mtx);
+        if (fallback != best) {
+            fallback = best;
+            std::cout << "[location] auto-detected OUR_LOCATION=" << best << "\n";
+        }
+        return fallback;
+    }
+    // Until detected, return safe default. Lead-lag will mostly no-op
+    // because we report ZSE conservatively.
+    static std::string def(Params::OUR_LOCATION);
+    return def;
 }
 
 static const std::vector<LeadLagPair> LEAD_LAG_TABLE = {
@@ -938,6 +1020,8 @@ private:
                 auto type = m->value("type","");
                 if (type == "market_data_update") {
                     int64_t srv_t = m->value("time", (int64_t)0);
+                    // Auto co-location: track per-venue one-way latency.
+                    latency_tracker().record(name, now_ms(), srv_t);
                     if (m->contains("orderbook_depths")) {
                         for (auto& [inst, ob] : (*m)["orderbook_depths"].items())
                             state_.update_book(name, inst,
@@ -991,8 +1075,18 @@ int main() {
     std::cout << "AlgoTrade 2026 bot — exchanges:";
     for (auto& e : exchanges) std::cout << " " << e;
     std::cout << "\n";
-    std::cout << "[location] OUR_LOCATION=" << our_location()
-              << "  safety=" << Params::LEAD_LAG_LATENCY_SAFETY_MS << "ms\n";
+    {
+        const char* loc_env = std::getenv("LOC");
+        if (loc_env && *loc_env) {
+            std::cout << "[location] LOC=" << loc_env
+                      << " (manual override)  safety="
+                      << Params::LEAD_LAG_LATENCY_SAFETY_MS << "ms\n";
+        } else {
+            std::cout << "[location] auto-detecting (will lock after ~30 samples"
+                         " from 7+ venues, ~3-5s)  safety="
+                      << Params::LEAD_LAG_LATENCY_SAFETY_MS << "ms\n";
+        }
+    }
     {
         int kept=0, dropped=0;
         std::map<std::string,int> per_lag;
