@@ -734,7 +734,7 @@ void Strategy::coint_basket_trade(const std::string& exch) {
         if (target != prev) {
             cs->target_state = target;
             any_changed = true;
-            std::cout << "[ZSE coint-" << cb.name << "] z=" << z
+            std::cout << "[" << exch << " coint-" << cb.name << "] z=" << z
                       << " (μ=" << mean << ", σ=" << sd << ")"
                       << " state " << prev << " → " << target << "\n";
         }
