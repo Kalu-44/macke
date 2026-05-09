@@ -473,6 +473,7 @@ public:
         });
     }
     bool place_ioc(const std::string& inst, const std::string& side, int price, int qty) {
+        std::cout << "Sending ioc req";
         return send({
             {"type","add_order"}, {"user_request_id", next_rid()},
             {"instrument_id", inst}, {"price", price},
