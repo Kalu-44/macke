@@ -706,3 +706,719 @@ public:
             if (!v.is_array() || v.size() < 2) continue;
             if (k == "$") cash_cents = v[1].get<long>();
             else positions[k] = v[1].get<int>();
+        }
+    }
+
+    int position_of(const std::string& inst) {
+        std::lock_guard lk(pos_mtx);
+        auto it = positions.find(inst);
+        return it==positions.end() ? 0 : it->second;
+    }
+
+    void on_segment_reset() {
+        std::lock_guard lk(pos_mtx);
+        positions.clear();
+        cash_cents = 10'000'000;
+        pnl_estimate = 0;
+        killed = false;
+    }
+
+private:
+    std::string name_, host_;
+    std::unique_ptr<net::io_context> ioc_;
+    std::unique_ptr<websocket::stream<tcp::socket>> ws_;
+    std::atomic<bool> connected_{false};
+    int rid_ = 0;
+    std::mutex write_mtx_, send_mtx_;
+    std::vector<int64_t> send_times_;
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  Strategy (called from each exchange's reader thread)
+// ════════════════════════════════════════════════════════════════════
+class Bot;
+
+class Strategy {
+public:
+    Strategy(MarketState& s, std::unordered_map<std::string,std::unique_ptr<ExchangeConnection>>& c)
+        : state_(s), conns_(c) {}
+
+    void on_market_data(const std::string& exch, int64_t server_time_ms);
+    void record_history();
+    void reset_segment() {
+        std::lock_guard lk(coint_mtx_);
+        coint_state_.clear();
+    }
+
+private:
+    bool can_buy(ExchangeConnection& c, const std::string& inst, int qty, int px);
+    bool can_sell(ExchangeConnection& c, const std::string& inst, int qty);
+
+    void etf_arb(const std::string& exch);
+    void xvenue_arb(const std::string& exch);
+    void stale_arb(const std::string& exch);
+    void market_make(const std::string& exch);
+    void pattern_trade(const std::string& exch);
+    void sector_momentum(const std::string& exch);
+    void safe_haven(const std::string& exch);
+    void unwind(const std::string& exch);
+    void coint_basket_trade(const std::string& exch);
+    void lead_lag_arb(const std::string& exch);
+
+    MarketState& state_;
+    std::unordered_map<std::string,std::unique_ptr<ExchangeConnection>>& conns_;
+    std::unordered_map<std::string,int64_t> last_run_;
+    std::mutex last_run_mtx_;
+
+    // Per-instrument cooldown to suppress order spam after a fire.
+    std::unordered_map<std::string,int64_t> last_inst_order_;
+    std::mutex inst_cd_mtx_;
+    bool inst_cooldown_ok(const std::string& inst) {
+        std::lock_guard lk(inst_cd_mtx_);
+        int64_t t = now_ms();
+        auto it = last_inst_order_.find(inst);
+        if (it != last_inst_order_.end() && t - it->second < Params::INST_COOLDOWN_MS)
+            return false;
+        last_inst_order_[inst] = t;
+        return true;
+    }
+
+    // Per-basket spread history & state (keyed by basket name).
+    struct CointState {
+        std::vector<double> spread_hist;   // last COINT_HISTORY values
+        int64_t last_rebal_ms = 0;
+        int target_state = 0;              // -1 = short basket, +1 = long basket, 0 = flat
+    };
+    std::unordered_map<std::string, CointState> coint_state_;
+    std::mutex coint_mtx_;
+};
+
+bool Strategy::can_buy(ExchangeConnection& c, const std::string& inst, int qty, int px) {
+    if (c.killed) return false;
+    int pos = c.position_of(inst);
+    if (pos + qty > Params::MAX_LONG) return false;
+    std::lock_guard lk(c.pos_mtx);
+    if (c.cash_cents - (long)px*qty < Params::CASH_FLOOR) return false;
+    return true;
+}
+bool Strategy::can_sell(ExchangeConnection& c, const std::string& inst, int qty) {
+    if (c.killed) return false;
+    int pos = c.position_of(inst);
+    if (pos - qty < Params::MAX_SHORT) return false;
+    return true;
+}
+
+void Strategy::on_market_data(const std::string& exch, int64_t server_time_ms) {
+    {
+        std::lock_guard lk(last_run_mtx_);
+        auto t = now_ms();
+        auto& last = last_run_[exch];
+        if (t - last < Params::STRAT_MIN_INTERVAL_MS) return;
+        last = t;
+    }
+    try {
+        // End-of-segment unwind takes priority — once close to end, only flatten
+        if (Params::ENABLE_UNWIND &&
+            server_time_ms >= Params::ROUND_LEN_MS - Params::UNWIND_BEFORE_END_MS) {
+            unwind(exch);
+            return;
+        }
+        if (Params::ENABLE_ETF_ARB && state_.warmup_done())    etf_arb(exch);
+        if (Params::ENABLE_XVENUE_ARB && state_.warmup_done()) xvenue_arb(exch);
+        if (Params::ENABLE_STALE_ARB && state_.warmup_done())  stale_arb(exch);
+        if (Params::ENABLE_PATTERN)    pattern_trade(exch);
+        if (Params::ENABLE_SECTOR)     sector_momentum(exch);
+        if (Params::ENABLE_SAFEHAVEN)  safe_haven(exch);
+        if (Params::ENABLE_MM)         market_make(exch);
+        if (Params::ENABLE_COINT)      coint_basket_trade(exch);
+        if (Params::ENABLE_LEAD_LAG)   lead_lag_arb(exch);
+    } catch (const std::exception& e) {
+        std::cerr << "[" << exch << "] strategy error: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[" << exch << "] strategy unknown error\n";
+    }
+}
+
+// Sample mid into history (called once per market_data_update, not per-exchange)
+void Strategy::record_history() {
+    int64_t t = now_ms();
+    for (auto& [tkr, _] : STOCK_LISTINGS) {
+        auto m = state_.consensus_mid(tkr);
+        if (m) state_.record_history(tkr, *m, t);
+    }
+}
+
+void Strategy::etf_arb(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    for (auto& [etf, exs] : ETF_LISTINGS) {
+        if (std::find(exs.begin(), exs.end(), exch) == exs.end()) continue;
+        std::string inst = exch + "-" + etf;
+        auto bk = state_.get(exch, inst); if (!bk) continue;
+        auto nav = state_.etf_nav(etf);   if (!nav) continue;
+        const int edge = etf_edge_for(etf);
+
+        // ETF bid > NAV + edge → SELL (hit bid)
+        if (bk->best_bid() && (*bk->best_bid() - *nav) >= edge) {
+            int qty = std::min(Params::ARB_SIZE, *bk->best_bid_qty());
+            if (qty > 0 && can_sell(c, inst, qty) && inst_cooldown_ok(inst))
+                c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+        }
+        // ETF ask < NAV - edge → BUY (lift ask)
+        if (bk->best_ask() && (*nav - *bk->best_ask()) >= edge) {
+            int qty = std::min(Params::ARB_SIZE, *bk->best_ask_qty());
+            if (qty > 0 && can_buy(c, inst, qty, *bk->best_ask()) && inst_cooldown_ok(inst))
+                c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+        }
+    }
+}
+
+void Strategy::xvenue_arb(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    auto try_pair = [&](const std::string& tkr,
+                        const std::vector<std::string>& exs) {
+        if (std::find(exs.begin(), exs.end(), exch) == exs.end()) return;
+        if (exs.size() < 2) return;
+        std::string inst_here = exch + "-" + tkr;
+        auto bk = state_.get(exch, inst_here); if (!bk) return;
+
+        // Buy here, sell on best other-venue bid
+        if (bk->best_ask()) {
+            auto best_bid = state_.best_bid_xv(tkr);
+            if (best_bid && best_bid->exchange != exch
+                && best_bid->price - *bk->best_ask() >= Params::XVENUE_EDGE) {
+                int qty = std::min({Params::ARB_SIZE, *bk->best_ask_qty(), best_bid->qty});
+                std::string inst_other = best_bid->exchange + "-" + tkr;
+                auto& c2 = *conns_.at(best_bid->exchange);
+                if (qty > 0 && can_buy(c, inst_here, qty, *bk->best_ask())
+                            && can_sell(c2, inst_other, qty)
+                            && inst_cooldown_ok(inst_here)
+                            && inst_cooldown_ok(inst_other)) {
+                    c.place_ioc(inst_here, "bid", *bk->best_ask(), qty);
+                    c2.place_ioc(inst_other, "ask", best_bid->price, qty);
+                }
+            }
+        }
+    };
+    for (auto& [t,exs] : STOCK_LISTINGS) try_pair(t, exs);
+    for (auto& [t,exs] : ETF_LISTINGS)   try_pair(t, exs);
+}
+
+// Snipe stale single-venue mid that drifted from cross-venue consensus.
+void Strategy::stale_arb(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    for (auto& [tkr, exs] : STOCK_LISTINGS) {
+        if (std::find(exs.begin(), exs.end(), exch) == exs.end()) continue;
+        if (exs.size() < 3) continue;  // need consensus
+        std::string inst = exch + "-" + tkr;
+        auto bk = state_.get(exch, inst); if (!bk) continue;
+        auto cm = state_.consensus_mid(tkr); if (!cm) continue;
+
+        // ask here way below consensus → buy here
+        if (bk->best_ask() && (*cm - *bk->best_ask()) >= Params::STALE_EDGE) {
+            int qty = std::min(Params::ARB_SIZE, *bk->best_ask_qty());
+            if (qty > 0 && can_buy(c, inst, qty, *bk->best_ask()) && inst_cooldown_ok(inst))
+                c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+        }
+        // bid here way above consensus → sell here
+        if (bk->best_bid() && (*bk->best_bid() - *cm) >= Params::STALE_EDGE) {
+            int qty = std::min(Params::ARB_SIZE, *bk->best_bid_qty());
+            if (qty > 0 && can_sell(c, inst, qty) && inst_cooldown_ok(inst))
+                c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+        }
+    }
+}
+
+void Strategy::market_make(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    for (const std::string tkr : {"CARD","SIMP"}) {
+        std::string inst = exch + "-" + tkr;
+        auto bk = state_.get(exch, inst);
+        if (!bk || !bk->best_bid() || !bk->best_ask()) continue;
+        int sp = *bk->spread();
+        if (sp < Params::MM_MIN_SPREAD) continue;
+
+        int pos = c.position_of(inst);
+        int skew = pos * Params::MM_INV_SKEW_C;
+        int mid = (*bk->best_bid() + *bk->best_ask()) / 2;
+        int bid_px = std::min(*bk->best_bid() + Params::MM_QUOTE_INSIDE, mid - 1) - skew;
+        int ask_px = std::max(*bk->best_ask() - Params::MM_QUOTE_INSIDE, mid + 1) - skew;
+        if (bid_px >= ask_px) continue;
+
+        int qty = Params::MM_SIZE;
+        if (pos < Params::MAX_LONG - qty && can_buy(c, inst, qty, bid_px))
+            c.place_limit(inst, "bid", bid_px, qty);
+        if (pos > Params::MAX_SHORT + qty && can_sell(c, inst, qty))
+            c.place_limit(inst, "ask", ask_px, qty);
+    }
+}
+
+// ─── Pattern trade: mean-revert on PATTERN_TICKERS ───────────────────
+// Z-score around the rolling mean of the cross-venue consensus mid.
+//   z >= +PATTERN_ENTRY_STDEV/100  → SHORT (price too high, will revert down)
+//   z <= -PATTERN_ENTRY_STDEV/100  → LONG  (price too low,  will revert up)
+//   |z| <= PATTERN_EXIT_STDEV/100  → CLOSE existing position toward zero
+// This implements the proper mean-reversion lifecycle: enter on extreme,
+// exit at the mean (don't wait until segment-end unwind).
+void Strategy::pattern_trade(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    for (auto& tkr : PATTERN_TICKERS) {
+        if (std::find(listings_for(tkr).begin(), listings_for(tkr).end(), exch)
+            == listings_for(tkr).end()) continue;
+        std::string inst = exch + "-" + tkr;
+        auto bk = state_.get(exch, inst); if (!bk) continue;
+        auto st = state_.stats(tkr);      if (!st) continue;
+        if (st->stdev < 5.0) continue;  // not enough variation yet
+
+        double z = (st->last - st->mean) / st->stdev;  // standardized
+        int pos = c.position_of(inst);
+
+        const double entry = Params::PATTERN_ENTRY_STDEV / 100.0;
+        const double exit  = Params::PATTERN_EXIT_STDEV  / 100.0;
+
+        // ── EXIT first: close existing position when price crosses back to mean
+        if (std::abs(z) <= exit) {
+            if (pos > 0 && bk->best_bid()) {
+                int qty = std::min(pos, std::min(Params::PATTERN_SIZE, *bk->best_bid_qty()));
+                if (qty > 0) c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+            } else if (pos < 0 && bk->best_ask()) {
+                int qty = std::min(-pos, std::min(Params::PATTERN_SIZE, *bk->best_ask_qty()));
+                if (qty > 0) c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+            }
+            continue;
+        }
+
+        // ── ENTRY: open against the deviation (mean-revert)
+        if (z >= entry) {
+            if (bk->best_bid()) {
+                int qty = std::min(Params::PATTERN_SIZE, *bk->best_bid_qty());
+                if (qty > 0 && can_sell(c, inst, qty))
+                    c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+            }
+        } else if (z <= -entry) {
+            if (bk->best_ask()) {
+                int qty = std::min(Params::PATTERN_SIZE, *bk->best_ask_qty());
+                if (qty > 0 && can_buy(c, inst, qty, *bk->best_ask()))
+                    c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+            }
+        }
+    }
+}
+
+// ─── Sector momentum: if peers in same sector moved up/down recently
+// but THIS stock hasn't, trade in the direction of the peers. ─────────
+void Strategy::sector_momentum(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    for (auto& [_, members] : SECTORS) {
+        // Compute average pct change of sector over short lookback
+        double sum_chg = 0; int n = 0;
+        std::map<std::string,double> chgs;
+        for (auto& tkr : members) {
+            auto st = state_.stats(tkr);
+            if (!st) continue;
+            double chg = st->slope_per_tick * Params::SECTOR_LOOKBACK_TICKS / st->mean;
+            chgs[tkr] = chg;
+            sum_chg += chg; n++;
+        }
+        if (n < 4) continue;
+        double sector_chg = sum_chg / n;
+        double trigger = Params::SECTOR_TRIGGER_BPS / 10000.0;
+        if (std::abs(sector_chg) < trigger) continue;
+
+        // For each member listed on this exchange: if its own change lags
+        // the sector by > trigger/2, fire in the sector's direction.
+        for (auto& tkr : members) {
+            if (chgs.find(tkr) == chgs.end()) continue;
+            if (std::find(listings_for(tkr).begin(), listings_for(tkr).end(), exch)
+                == listings_for(tkr).end()) continue;
+            std::string inst = exch + "-" + tkr;
+            auto bk = state_.get(exch, inst); if (!bk) continue;
+            double laggard = chgs[tkr];
+            if (sector_chg > 0 && laggard < sector_chg - trigger/2 && bk->best_ask()) {
+                int qty = std::min(Params::SECTOR_SIZE, *bk->best_ask_qty());
+                if (qty > 0 && can_buy(c, inst, qty, *bk->best_ask()))
+                    c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+            } else if (sector_chg < 0 && laggard > sector_chg + trigger/2 && bk->best_bid()) {
+                int qty = std::min(Params::SECTOR_SIZE, *bk->best_bid_qty());
+                if (qty > 0 && can_sell(c, inst, qty))
+                    c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+            }
+        }
+    }
+}
+
+// ─── Safe-haven: GOLD/XAG move INVERSELY with the market ─────────────
+void Strategy::safe_haven(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    auto idx_now = state_.market_index();
+    if (!idx_now) return;
+    // Estimate market trend from average of stats() slopes for market tickers
+    double sum_chg = 0; int n = 0;
+    for (auto& tkr : MARKET_TICKERS) {
+        auto st = state_.stats(tkr);
+        if (!st) continue;
+        sum_chg += st->slope_per_tick * Params::SAFEHAVEN_LOOKBACK_TICKS / st->mean;
+        n++;
+    }
+    if (n < 6) return;
+    double mkt_chg = sum_chg / n;
+    double trigger = Params::SAFEHAVEN_TRIGGER_BPS / 10000.0;
+    if (std::abs(mkt_chg) < trigger) return;
+
+    for (auto& tkr : SAFEHAVEN_TICKERS) {
+        if (std::find(listings_for(tkr).begin(), listings_for(tkr).end(), exch)
+            == listings_for(tkr).end()) continue;
+        std::string inst = exch + "-" + tkr;
+        auto bk = state_.get(exch, inst); if (!bk) continue;
+        // Market falling -> safe haven should rise -> buy
+        if (mkt_chg < 0 && bk->best_ask()) {
+            int qty = std::min(Params::SAFEHAVEN_SIZE, *bk->best_ask_qty());
+            if (qty > 0 && can_buy(c, inst, qty, *bk->best_ask()))
+                c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+        } else if (mkt_chg > 0 && bk->best_bid()) {
+            int qty = std::min(Params::SAFEHAVEN_SIZE, *bk->best_bid_qty());
+            if (qty > 0 && can_sell(c, inst, qty))
+                c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+        }
+    }
+}
+
+// ─── Cointegrated basket stat-arb ────────────────────────────────────
+// For each basket whose venue == exch:
+//   1. Read venue-local mids for each leg, compute spread = Σ β_i · mid_i
+//   2. Push spread into rolling history; once we have ≥ COINT_MIN_SAMPLES,
+//      compute z = (s − μ)/σ
+//   3. Determine target_state with hysteresis:
+//        -1 (short spread) if z >=  entry
+//        +1 (long  spread) if z <= -entry
+//         0 (flat)         if |z| <= exit
+//        else hold previous
+//   4. After updating ALL baskets' target_states, AGGREGATE per-leg desired
+//      position across baskets (handles overlapping legs like INA in B1+B2):
+//        target_pos[ticker] = Σ_basket (basket.state · round(K · β_basket,ticker))
+//      Then send IOCs to push current position toward aggregated target.
+void Strategy::coint_basket_trade(const std::string& exch) {
+    // Step 1+2+3: update each basket's target_state. Track which baskets
+    // are active on this venue so we can aggregate after.
+    std::vector<const CointBasket*> active;
+    int64_t now = now_ms();
+    bool any_changed = false;
+
+    for (const auto& cb : COINT_BASKETS) {
+        if (cb.venue != exch) continue;
+        if (cb.legs.empty()) continue;
+
+        double spread = 0.0;
+        bool ok = true;
+        for (auto& [tkr, beta] : cb.legs) {
+            std::string inst = cb.venue + "-" + tkr;
+            auto book = state_.get(cb.venue, inst);
+            if (!book) { ok = false; break; }
+            auto m = book->mid();
+            if (!m) { ok = false; break; }
+            spread += beta * (*m);
+        }
+        if (!ok) continue;
+        active.push_back(&cb);
+
+        CointState* cs;
+        {
+            std::lock_guard lk(coint_mtx_);
+            cs = &coint_state_[cb.name];
+            cs->spread_hist.push_back(spread);
+            if ((int)cs->spread_hist.size() > Params::COINT_HISTORY)
+                cs->spread_hist.erase(cs->spread_hist.begin());
+        }
+
+        if ((int)cs->spread_hist.size() < Params::COINT_MIN_SAMPLES) continue;
+
+        std::vector<double> snap;
+        {
+            std::lock_guard lk(coint_mtx_);
+            snap = cs->spread_hist;
+        }
+        double sum = 0, sumsq = 0;
+        for (double v : snap) { sum += v; sumsq += v*v; }
+        double n = snap.size();
+        double mean = sum / n;
+        double var = std::max(1e-12, sumsq/n - mean*mean);
+        double sd = std::sqrt(var);
+        if (sd < 1e-6) continue;
+        double z = (spread - mean) / sd;
+
+        const double entry = Params::COINT_ENTRY_Z100 / 100.0;
+        const double exit_ = Params::COINT_EXIT_Z100  / 100.0;
+
+        int prev = cs->target_state;
+        int target = prev;
+        if (z >= entry)              target = -1;
+        else if (z <= -entry)        target = +1;
+        else if (std::abs(z) <= exit_) target = 0;
+
+        if (target != prev) {
+            cs->target_state = target;
+            any_changed = true;
+            std::cout << "[ZSE coint-" << cb.name << "] z=" << z
+                      << " (μ=" << mean << ", σ=" << sd << ")"
+                      << " state " << prev << " → " << target << "\n";
+        }
+    }
+
+    // Throttle: only rebalance if something changed and not too soon.
+    if (!any_changed) return;
+    {
+        std::lock_guard lk(coint_mtx_);
+        // Single global throttle keyed by venue (cheaper than per-basket here
+        // because we already gate on any_changed).
+        auto& cs0 = coint_state_["__throttle_" + exch];
+        if (now - cs0.last_rebal_ms < Params::COINT_REBAL_MS) return;
+        cs0.last_rebal_ms = now;
+    }
+
+    // Step 4: aggregate per-leg target positions across all baskets.
+    auto& c = *conns_.at(exch);
+    std::unordered_map<std::string, int> target_by_inst;  // inst -> target shares
+    for (const auto* cbp : active) {
+        const auto& cb = *cbp;
+        int state;
+        {
+            std::lock_guard lk(coint_mtx_);
+            state = coint_state_[cb.name].target_state;
+        }
+        for (auto& [tkr, beta] : cb.legs) {
+            std::string inst = cb.venue + "-" + tkr;
+            int leg_units = (int)std::lround(Params::COINT_BASKET_K * beta);
+            target_by_inst[inst] += state * leg_units;
+        }
+    }
+
+    // Send IOCs to move each instrument toward its aggregated target.
+    for (auto& [inst, target_pos] : target_by_inst) {
+        int cur  = c.position_of(inst);
+        int diff = target_pos - cur;
+        if (diff == 0) continue;
+
+        auto book = state_.get(exch, inst);
+        if (!book) continue;
+
+        if (diff > 0) {
+            if (!book->best_ask() || !book->best_ask_qty()) continue;
+            int qty = std::min({diff, *book->best_ask_qty(), 100});
+            if (qty <= 0 || !can_buy(c, inst, qty, *book->best_ask())) continue;
+            c.place_ioc(inst, "bid", *book->best_ask(), qty);
+        } else {
+            int need = -diff;
+            if (!book->best_bid() || !book->best_bid_qty()) continue;
+            int qty = std::min({need, *book->best_bid_qty(), 100});
+            if (qty <= 0 || !can_sell(c, inst, qty)) continue;
+            c.place_ioc(inst, "ask", *book->best_bid(), qty);
+        }
+    }
+}
+
+// ─── Cross-venue lead-lag arbitrage ──────────────────────────────────
+// For each (lead, lag, ticker) pair where the lead venue's price moves
+// first, take liquidity on the lag venue's stale quote before its MM
+// updates. Verified in offline analysis: 58 pairs with corr ≥ 0.95.
+void Strategy::lead_lag_arb(const std::string& exch) {
+    if (!state_.warmup_done()) return;
+    auto& c = *conns_.at(exch);
+
+    for (const auto& p : LEAD_LAG_TABLE) {
+        if (p.lag != exch) continue;  // we only trade ON the lag venue
+
+        std::string lead_inst = p.lead + "-" + p.ticker;
+        std::string lag_inst  = p.lag  + "-" + p.ticker;
+
+        auto lead_book = state_.get(p.lead, lead_inst); if (!lead_book) continue;
+        auto lag_book  = state_.get(p.lag,  lag_inst);  if (!lag_book)  continue;
+
+        auto lead_mid = lead_book->mid(); if (!lead_mid) continue;
+        auto lag_bid = lag_book->best_bid();
+        auto lag_ask = lag_book->best_ask();
+
+        // Lead is ABOVE lag's ask → buy lag (lag is too cheap)
+        if (lag_ask && (*lead_mid - *lag_ask) >= Params::LEAD_LAG_EDGE_CENTS) {
+            int avail = lag_book->best_ask_qty().value_or(0);
+            int qty = std::min({Params::LEAD_LAG_SIZE, avail});
+            if (qty > 0 && can_buy(c, lag_inst, qty, *lag_ask)
+                && inst_cooldown_ok(lag_inst)) {
+                c.place_ioc(lag_inst, "bid", *lag_ask, qty);
+            }
+        }
+        // Lead is BELOW lag's bid → sell lag (lag is too expensive)
+        if (lag_bid && (*lag_bid - *lead_mid) >= Params::LEAD_LAG_EDGE_CENTS) {
+            int avail = lag_book->best_bid_qty().value_or(0);
+            int qty = std::min({Params::LEAD_LAG_SIZE, avail});
+            if (qty > 0 && can_sell(c, lag_inst, qty)
+                && inst_cooldown_ok(lag_inst)) {
+                c.place_ioc(lag_inst, "ask", *lag_bid, qty);
+            }
+        }
+    }
+}
+
+// ─── End-of-segment unwind: aggressively flatten all positions ────────
+void Strategy::unwind(const std::string& exch) {
+    auto& c = *conns_.at(exch);
+    // Snapshot positions so we don't hold pos_mtx during network IO
+    std::vector<std::pair<std::string,int>> snap;
+    {
+        std::lock_guard lk(c.pos_mtx);
+        for (auto& [inst, pos] : c.positions) {
+            if (pos == 0) continue;
+            if (inst.rfind(exch + "-", 0) != 0) continue;
+            snap.emplace_back(inst, pos);
+        }
+    }
+    for (auto& [inst, pos] : snap) {
+        auto bk = state_.get(exch, inst); if (!bk) continue;
+        if (pos > 0) {
+            if (!bk->best_bid()) continue;
+            int qty = std::min(pos, 100);
+            c.place_ioc(inst, "ask", *bk->best_bid(), qty);
+        } else {
+            if (!bk->best_ask()) continue;
+            int qty = std::min(-pos, 100);
+            c.place_ioc(inst, "bid", *bk->best_ask(), qty);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Bot — orchestrator with auto-reconnect across segments
+// ════════════════════════════════════════════════════════════════════
+class Bot {
+public:
+    void run(const std::vector<std::string>& exchanges) {
+        for (auto& name : exchanges) {
+            auto host = lookup_host(name);
+            if (!host) { std::cerr << "unknown exchange: " << name << "\n"; continue; }
+            conns_.emplace(name, std::make_unique<ExchangeConnection>(name, *host));
+        }
+        strategy_ = std::make_unique<Strategy>(state_, conns_);
+
+        std::vector<std::thread> ts;
+        for (auto& [name, _] : conns_)
+            ts.emplace_back([this, name]{ exchange_loop(name); });
+
+        // periodic inventory sync + activity report
+        std::thread inv([this]{
+            long prev_sent[16] = {0}, prev_fill[16] = {0}, prev_rej[16] = {0};
+            while (running_) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                int i = 0;
+                std::ostringstream report;
+                report << "[stats] ";
+                for (auto& [name, c] : conns_) {
+                    if (c->connected()) c->get_inventory();
+                    long s = c->orders_sent_.load();
+                    long f = c->orders_filled_.load();
+                    long r = c->orders_rejected_.load();
+                    long ds = s - prev_sent[i];
+                    long df = f - prev_fill[i];
+                    long dr = r - prev_rej[i];
+                    prev_sent[i] = s; prev_fill[i] = f; prev_rej[i] = r;
+                    long cash;
+                    {
+                        std::lock_guard lk(c->pos_mtx);
+                        cash = c->cash_cents;
+                    }
+                    if (ds > 0 || df > 0 || dr > 0) {
+                        report << name << "(s" << ds << "/f" << df << "/r" << dr
+                               << " $" << (cash/100) << ") ";
+                    }
+                    ++i;
+                }
+                std::string s = report.str();
+                if (s.size() > 9) std::cout << s << "\n";
+            }
+        });
+
+        for (auto& t : ts) t.join();
+        running_ = false;
+        inv.join();
+    }
+
+private:
+    void exchange_loop(const std::string& name) {
+        auto& c = *conns_.at(name);
+        int backoff = 1;
+        while (running_) {
+            if (!c.connect()) {
+                std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                backoff = std::min(backoff*2, 8);
+                continue;
+            }
+            backoff = 1;
+            c.on_segment_reset();
+            state_.reset_history();
+            state_.reset_warmup();
+            if (strategy_) strategy_->reset_segment();
+            std::cout << "[" << name << "] connected\n";
+
+            while (running_ && c.connected()) {
+                auto m = c.recv();
+                if (!m) break;
+                auto type = m->value("type","");
+                if (type == "market_data_update") {
+                    int64_t srv_t = m->value("time", (int64_t)0);
+                    if (m->contains("orderbook_depths")) {
+                        for (auto& [inst, ob] : (*m)["orderbook_depths"].items())
+                            state_.update_book(name, inst,
+                                               ob.value("bids", json::object()),
+                                               ob.value("asks", json::object()), srv_t);
+                    }
+                    state_.note_venue_alive(name);
+                    strategy_->record_history();
+                    strategy_->on_market_data(name, srv_t);
+                } else if (type == "add_order_response") {
+                    c.apply_add_order_resp(*m);
+                } else if (type == "get_inventory_response") {
+                    c.apply_inventory(*m);
+                } else if (type == "end_of_round") {
+                    std::cout << "[" << name << "] end_of_round; reconnecting for next segment\n";
+                    break;
+                } else if (type == "error") {
+                    std::cerr << "[" << name << "] error: " << m->value("message","") << "\n";
+                }
+            }
+            c.disconnect();
+            // small pause before reconnect (next segment server may take a moment)
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+
+    MarketState state_;
+    std::unordered_map<std::string,std::unique_ptr<ExchangeConnection>> conns_;
+    std::unique_ptr<Strategy> strategy_;
+    std::atomic<bool> running_{true};
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  main
+// ════════════════════════════════════════════════════════════════════
+static std::vector<std::string> parse_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream is(s); std::string tok;
+    while (std::getline(is, tok, ',')) {
+        auto a = tok.find_first_not_of(" \t");
+        auto b = tok.find_last_not_of(" \t");
+        if (a != std::string::npos) out.push_back(tok.substr(a, b-a+1));
+    }
+    return out;
+}
+
+int main() {
+    std::vector<std::string> exchanges;
+    if (const char* v = std::getenv("EXCHANGES")) exchanges = parse_csv(v);
+    if (exchanges.empty())
+        for (auto& [n,_] : EXCHANGE_HOSTS) exchanges.push_back(n);
+
+    std::cout << "AlgoTrade 2026 bot — exchanges:";
+    for (auto& e : exchanges) std::cout << " " << e;
+    std::cout << "\n";
+
+    Bot bot;
+    bot.run(exchanges);
+    return 0;
+}
