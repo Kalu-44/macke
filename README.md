@@ -1,2 +1,0 @@
-# macke
-Repo za hakaton
