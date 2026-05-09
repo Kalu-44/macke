@@ -329,21 +329,64 @@ struct LatencyTracker {
     }
 
     // Returns "" until we've seen ≥30 samples from ≥7 venues.
+    // Uses shape-matching against RTT_MS to pick best of {NYSE, ZSE, HKEX}.
+    // Method:
+    //   measured[X] = ema(local_ms - server_ms)   (includes unknown clock offset)
+    //   For each candidate L ∈ {NYSE, ZSE, HKEX}:
+    //     predicted[X] = RTT_MS[L][X] / 2
+    //     residual[X]  = measured[X] - predicted[X]
+    //     median_off   = median(residual)         (this is L's clock offset to us)
+    //     score(L)     = sum((residual[X] - median_off)^2)
+    //   Best L = lowest score (best shape match — clock offsets cancel out).
     std::string snapshot_best() {
+        static const std::vector<std::string> CANDIDATES = {"NYSE", "ZSE", "HKEX"};
         std::lock_guard lk(mtx);
         if (!detected_loc.empty()) return detected_loc;
         int ready = 0;
         for (auto& [_, n] : samples) if (n >= 30) ++ready;
         if (ready < 7) return "";
-        std::string best;
-        double best_v = 1e18;
+
+        std::vector<std::pair<std::string,double>> measured;
+        measured.reserve(ema_one_way.size());
         for (auto& [exch, v] : ema_one_way) {
-            if (samples[exch] < 30) continue;
-            if (v < best_v) { best_v = v; best = exch; }
+            if (samples[exch] >= 30) measured.emplace_back(exch, v);
         }
+        if (measured.size() < 7) return "";
+
+        std::string best;
+        double best_score = 1e18;
+        std::vector<std::pair<std::string,double>> scores;
+        scores.reserve(CANDIDATES.size());
+
+        for (auto& cand : CANDIDATES) {
+            // residuals = measured - predicted_oneway_from_cand
+            std::vector<double> resid;
+            resid.reserve(measured.size());
+            for (auto& [exch, m] : measured) {
+                double pred = rtt_ms(cand, exch) / 2.0;
+                resid.push_back(m - pred);
+            }
+            // robust offset estimate = median(residuals)
+            std::vector<double> r = resid;
+            std::nth_element(r.begin(), r.begin() + r.size()/2, r.end());
+            double med = r[r.size()/2];
+            // sum of squared deviations from median
+            double score = 0.0;
+            for (double x : resid) {
+                double d = x - med;
+                score += d*d;
+            }
+            scores.emplace_back(cand, score);
+            if (score < best_score) { best_score = score; best = cand; }
+        }
+
         if (!best.empty()) {
             detected_loc = best;
             locked_at_ms = local_now_unsafe();
+            std::ostringstream os;
+            os << "[location] shape-match scores: ";
+            for (auto& [c, s] : scores) os << c << "=" << (long)s << " ";
+            std::cout << os.str() << "\n";
         }
         return detected_loc;
     }
