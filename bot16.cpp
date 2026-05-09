@@ -73,6 +73,11 @@ struct Params {
     static constexpr int  COINT_ENTRY_Z100  = 250;   // |z| >= 2.50
     static constexpr int  COINT_EXIT_Z100   = 30;    // |z| <= 0.30
     static constexpr int  COINT_REBAL_MS    = 250;
+    // Stop-loss: if a basket spread blows past |z|>=6 while we hold a
+    // position, the cointegration regime has likely broken for this
+    // segment. Flatten and refuse to re-enter for a cooldown.
+    static constexpr int  COINT_STOP_Z100      = 600;
+    static constexpr int  COINT_STOP_COOLDOWN_MS = 30'000;
 
     // ─── Lead-lag cross-venue arbitrage ─────────────────────────────
     static constexpr int  LEAD_LAG_EDGE_CENTS        = 10;
@@ -440,6 +445,27 @@ static const std::vector<LeadLagPair> LEAD_LAG_TABLE = {
 };
 
 // ════════════════════════════════════════════════════════════════════
+//  Cross-venue same-ticker arbitrage pairs (xvenue)
+//  Pure hedged arb: buy on cheaper venue, sell on richer venue.
+//  Restricted to near-pairs (RTT ≤ 30ms) so both legs fit inside an
+//  MM update window. We additionally require that we are co-located
+//  near the pair (one of the two venues, or another near-venue) before
+//  enabling — otherwise a stale quote can slip and one leg orphans.
+//
+//  Tickers per pair are auto-derived at runtime from common instruments
+//  observed in market data — we don't hardcode the universe here.
+// ════════════════════════════════════════════════════════════════════
+struct XVenuePair {
+    std::string a;
+    std::string b;
+};
+static const std::vector<XVenuePair> XVENUE_PAIRS = {
+    {"NYSE",   "NASDAQ"},   // RTT 1ms
+    {"NYSE",   "TMX"},      // RTT 11ms
+    {"NASDAQ", "TMX"},      // RTT 11ms
+};
+
+// ════════════════════════════════════════════════════════════════════
 //  Order book / market state
 // ════════════════════════════════════════════════════════════════════
 struct Book {
@@ -496,6 +522,16 @@ public:
         auto e = books_.find(exch); if (e==books_.end()) return std::nullopt;
         auto i = e->second.find(inst); if (i==e->second.end()) return std::nullopt;
         return i->second;
+    }
+
+    // List instruments observed on a venue (snapshot of names).
+    std::vector<std::string> instruments_on(const std::string& exch) const {
+        std::lock_guard lk(mtx_);
+        std::vector<std::string> out;
+        auto e = books_.find(exch); if (e==books_.end()) return out;
+        out.reserve(e->second.size());
+        for (auto& [k,_] : e->second) out.push_back(k);
+        return out;
     }
 
     // ─── Warmup tracking ────────────────────────────────────────────
@@ -691,6 +727,7 @@ private:
 
     void coint_basket_trade(const std::string& exch);
     void lead_lag_arb(const std::string& exch);
+    void xvenue_arb(const std::string& exch);
 
     MarketState& state_;
     std::unordered_map<std::string,std::unique_ptr<ExchangeConnection>>& conns_;
@@ -715,9 +752,14 @@ private:
         std::vector<double> spread_hist;
         int64_t last_rebal_ms = 0;
         int target_state = 0;   // -1 short / +1 long / 0 flat
+        int64_t stop_until_ms = 0;  // refuse new entries until this time
     };
     std::unordered_map<std::string, CointState> coint_state_;
     std::mutex coint_mtx_;
+
+    // xvenue per-(pair+ticker) cooldown
+    std::unordered_map<std::string,int64_t> last_xvenue_;
+    std::mutex xvenue_mtx_;
 };
 
 bool Strategy::can_buy(ExchangeConnection& c, const std::string& inst, int qty, int px) {
@@ -746,6 +788,7 @@ void Strategy::on_market_data(const std::string& exch) {
     try {
         coint_basket_trade(exch);
         lead_lag_arb(exch);
+        xvenue_arb(exch);
     } catch (const std::exception& e) {
         std::cerr << "[" << exch << "] strategy error: " << e.what() << "\n";
     } catch (...) {
@@ -806,19 +849,37 @@ void Strategy::coint_basket_trade(const std::string& exch) {
                                  : Params::COINT_ENTRY_Z100;
         const double entry = entry_z100 / 100.0;
         const double exit_ = Params::COINT_EXIT_Z100 / 100.0;
+        const double stop  = Params::COINT_STOP_Z100 / 100.0;
 
         int prev = cs->target_state;
         int target = prev;
-        if (z >= entry)                target = -1;
-        else if (z <= -entry)          target = +1;
-        else if (std::abs(z) <= exit_) target = 0;
+
+        // Stop-loss: regime broke. Flatten and lock out new entries.
+        bool tripped_stop = false;
+        if (std::abs(z) >= stop) {
+            if (prev != 0) {
+                target = 0;
+                tripped_stop = true;
+            }
+            cs->stop_until_ms = now + Params::COINT_STOP_COOLDOWN_MS;
+        }
+        // Block fresh entries during stop cooldown (still allow exit-to-flat).
+        bool in_cooldown = now < cs->stop_until_ms;
+
+        if (!tripped_stop) {
+            if (z >= entry && !in_cooldown)        target = -1;
+            else if (z <= -entry && !in_cooldown)  target = +1;
+            else if (std::abs(z) <= exit_)         target = 0;
+        }
 
         if (target != prev) {
             cs->target_state = target;
             any_changed = true;
             std::cout << "[" << exch << " coint-" << cb.name << "] z=" << z
                       << " (μ=" << mean << ", σ=" << sd << ")"
-                      << " state " << prev << " → " << target << "\n";
+                      << " state " << prev << " → " << target
+                      << (tripped_stop ? " [STOP-LOSS]" : "")
+                      << "\n";
         }
     }
 
@@ -939,6 +1000,125 @@ void Strategy::lead_lag_arb(const std::string& exch) {
                 && inst_cooldown_ok(lag_inst)) {
                 c.place_ioc(lag_inst, "ask", *lag_bid, qty);
             }
+        }
+    }
+}
+
+// ─── Cross-venue same-ticker hedged arbitrage ────────────────────────
+// Triggered from the LAG side of each pair (i.e. function is called
+// per-exchange; we look at pairs where `exch` is one of the two venues).
+// We require:
+//   * we are co-located near both venues (rtt to both ≤ XVENUE_MAX_PAIR_RTT)
+//   * both books have current bid/ask
+//   * bid_richer - ask_cheaper ≥ XVENUE_EDGE_CENTS
+//   * latency_ok with XVENUE_SAFETY_MS
+// Then send a paired IOC: lift the cheaper ask AND hit the richer bid.
+// If only one fills, the other side handles the now-naked exposure on
+// next on_market_data tick (small leg risk; mitigated by edge buffer).
+void Strategy::xvenue_arb(const std::string& exch) {
+    if (!state_.warmup_done()) return;
+    const std::string& my_loc = our_location();
+
+    for (const auto& pair : XVENUE_PAIRS) {
+        // Only act when this exchange is one of the pair's two venues.
+        if (pair.a != exch && pair.b != exch) continue;
+        // Must be co-located near both venues for safety.
+        int rtt_a = rtt_ms(my_loc, pair.a);
+        int rtt_b = rtt_ms(my_loc, pair.b);
+        if (rtt_a > Params::XVENUE_MAX_PAIR_RTT) continue;
+        if (rtt_b > Params::XVENUE_MAX_PAIR_RTT) continue;
+
+        // Find common tickers between the two venues.
+        auto insts_a = state_.instruments_on(pair.a);
+        auto insts_b_vec = state_.instruments_on(pair.b);
+        std::unordered_set<std::string> tickers_b;
+        for (auto& s : insts_b_vec) {
+            auto dash = s.find('-');
+            if (dash != std::string::npos) tickers_b.insert(s.substr(dash+1));
+        }
+
+        for (auto& inst_a : insts_a) {
+            auto dash = inst_a.find('-');
+            if (dash == std::string::npos) continue;
+            std::string ticker = inst_a.substr(dash+1);
+            if (!tickers_b.count(ticker)) continue;
+            std::string inst_b = pair.b + "-" + ticker;
+
+            auto book_a = state_.get(pair.a, inst_a); if (!book_a) continue;
+            auto book_b = state_.get(pair.b, inst_b); if (!book_b) continue;
+
+            auto a_bid = book_a->best_bid(); auto a_ask = book_a->best_ask();
+            auto b_bid = book_b->best_bid(); auto b_ask = book_b->best_ask();
+            if (!a_bid || !a_ask || !b_bid || !b_ask) continue;
+
+            // Direction 1: a is cheaper (a.ask < b.bid) → BUY a, SELL b
+            int edge_1 = *b_bid - *a_ask;
+            // Direction 2: b is cheaper (b.ask < a.bid) → BUY b, SELL a
+            int edge_2 = *a_bid - *b_ask;
+
+            std::string buy_v, sell_v, buy_inst, sell_inst;
+            int buy_px = 0, sell_px = 0, edge = 0;
+            int buy_qty_avail = 0, sell_qty_avail = 0;
+
+            if (edge_1 >= Params::XVENUE_EDGE_CENTS && edge_1 >= edge_2) {
+                buy_v = pair.a; sell_v = pair.b;
+                buy_inst = inst_a; sell_inst = inst_b;
+                buy_px = *a_ask; sell_px = *b_bid; edge = edge_1;
+                buy_qty_avail = book_a->best_ask_qty().value_or(0);
+                sell_qty_avail = book_b->best_bid_qty().value_or(0);
+            } else if (edge_2 >= Params::XVENUE_EDGE_CENTS) {
+                buy_v = pair.b; sell_v = pair.a;
+                buy_inst = inst_b; sell_inst = inst_a;
+                buy_px = *b_ask; sell_px = *a_bid; edge = edge_2;
+                buy_qty_avail = book_b->best_ask_qty().value_or(0);
+                sell_qty_avail = book_a->best_bid_qty().value_or(0);
+            } else {
+                continue;
+            }
+
+            // Latency feasibility check using 1ms placeholder (we only
+            // need both sides to actually reach the venues; the table's
+            // safety margin already accounts for MM update timing).
+            // We use lag_ms = XVENUE_SAFETY_MS*2 as a minimum survival
+            // window so latency_ok requires us strictly inside it.
+            int eff_window = Params::XVENUE_SAFETY_MS * 2 + 1;
+            if (!latency_ok(my_loc, buy_v, sell_v, eff_window,
+                            Params::XVENUE_SAFETY_MS)) continue;
+
+            // Per-pair+ticker cooldown
+            std::string cd_key = pair.a + "|" + pair.b + "|" + ticker;
+            {
+                std::lock_guard lk(xvenue_mtx_);
+                int64_t t = now_ms();
+                auto it = last_xvenue_.find(cd_key);
+                if (it != last_xvenue_.end()
+                    && t - it->second < Params::XVENUE_COOLDOWN_MS) continue;
+                last_xvenue_[cd_key] = t;
+            }
+
+            auto& c_buy  = *conns_.at(buy_v);
+            auto& c_sell = *conns_.at(sell_v);
+
+            int pos_buy  = c_buy.position_of(buy_inst);
+            int pos_sell = c_sell.position_of(sell_inst);
+
+            int headroom_buy  = Params::XVENUE_POS_CAP - pos_buy;
+            int headroom_sell = Params::XVENUE_POS_CAP + pos_sell;
+            int qty = std::min({Params::XVENUE_SIZE,
+                                buy_qty_avail, sell_qty_avail,
+                                headroom_buy, headroom_sell});
+            if (qty <= 0) continue;
+
+            if (!can_buy(c_buy, buy_inst, qty, buy_px)) continue;
+            if (!can_sell(c_sell, sell_inst, qty)) continue;
+
+            // Fire both legs back-to-back.
+            c_buy.place_ioc(buy_inst,  "bid", buy_px,  qty);
+            c_sell.place_ioc(sell_inst, "ask", sell_px, qty);
+            std::cout << "[xvenue " << ticker << "] buy " << buy_v
+                      << "@" << buy_px << " sell " << sell_v
+                      << "@" << sell_px << " edge=" << edge
+                      << "¢ qty=" << qty << "\n";
         }
     }
 }
@@ -1079,7 +1259,7 @@ int main() {
         const char* loc_env = std::getenv("LOC");
         if (loc_env && *loc_env) {
             std::cout << "[location] LOC=" << loc_env
-                      << " (manual override)  safety="
+                      << " (manual override)x`  safety="
                       << Params::LEAD_LAG_LATENCY_SAFETY_MS << "ms\n";
         } else {
             std::cout << "[location] auto-detecting (will lock after ~30 samples"
@@ -1088,17 +1268,21 @@ int main() {
         }
     }
     {
-        int kept=0, dropped=0;
-        std::map<std::string,int> per_lag;
-        for (auto& p : LEAD_LAG_TABLE) {
-            bool ok = latency_ok(our_location(), p.lead, p.lag,
-                                 p.lag_ms, Params::LEAD_LAG_LATENCY_SAFETY_MS);
-            if (ok) { kept++; per_lag[p.lag]++; } else dropped++;
+        // If LOC manually set, show what's tradeable. In auto-detect mode
+        // this would be misleading (uses default ZSE), so skip.
+        if (std::getenv("LOC")) {
+            int kept=0, dropped=0;
+            std::map<std::string,int> per_lag;
+            for (auto& p : LEAD_LAG_TABLE) {
+                bool ok = latency_ok(our_location(), p.lead, p.lag,
+                                     p.lag_ms, Params::LEAD_LAG_LATENCY_SAFETY_MS);
+                if (ok) { kept++; per_lag[p.lag]++; } else dropped++;
+            }
+            std::cout << "[lead-lag] " << kept << " pairs tradeable, "
+                      << dropped << " filtered by latency\n";
+            for (auto& [v,n] : per_lag)
+                std::cout << "    " << v << ": " << n << " pairs\n";
         }
-        std::cout << "[lead-lag] " << kept << " pairs tradeable, "
-                  << dropped << " filtered by latency\n";
-        for (auto& [v,n] : per_lag)
-            std::cout << "    " << v << ": " << n << " pairs\n";
     }
 
     Bot bot;
