@@ -121,8 +121,18 @@ struct CointBasket {
     int entry_z100_override = 0; // 0 → Params::COINT_ENTRY_Z100
 };
 
+// Per-venue cointegration vectors. Computed by coint_per_venue.py:
+//   - 4+ legs available  → Johansen (95% trace) when stationary
+//   - else / Johansen rejects → Engle-Granger (regress one on others)
+//   - ADF p<0.10 required on the resulting spread
+// Coefficients are normalized so |max β| = 0.02. Entry-z is per leg-count
+// (more legs = more DoF = looser entry).
+//
+// ZSE keeps the original team-validated 6-leg A (EG) + 2× B (Johansen 95%);
+// the script-found A_ZSE/B_ZSE were close to identical so we don't duplicate.
 static const std::vector<CointBasket> COINT_BASKETS = {
-    // Sector A — Engle-Granger single-vector
+    // ─── ZSE (home of the round) ─────────────────────────────────
+    // Sector A — Engle-Granger 6-leg, ADF p<0.01
     {"A", "ZSE", {
         {"FSR",  +0.0074},
         {"JZRO", -0.0058},
@@ -150,34 +160,88 @@ static const std::vector<CointBasket> COINT_BASKETS = {
         {"KOTD", -0.0027},
     }, 7500, 280},
 
-    // ─── Per-venue Johansen vectors (4-leg) — verified on training data ───
-    // Found by coint_per_venue.py. Tighter entry (|z|≥2.8) since 4-leg
-    // vectors have less degrees of freedom than ZSE 6-leg.
-
-    // NYSE Sector A — ADF p=0.0001 (NGUP/KTST/JZRO/XFR listed on NYSE)
+    // ─── NYSE ─────────────────────────────────────────────────────
+    // A: 4-leg Johansen, ADF p=0.0001
     {"A_NYSE", "NYSE", {
-        {"NGUP", +0.0014},
+        {"NGUP", +0.0017},
         {"KTST", +0.0003},
-        {"JZRO", -0.0031},
-        {"XFR",  +0.0156},
+        {"JZRO", -0.0040},
+        {"XFR",  +0.0200},
     }, 7500, 280},
+    // B: 3-leg Engle-Granger (INA on JNAF/DDJH), ADF p<0.0001
+    {"B_NYSE", "NYSE", {
+        {"INA",  +0.0200},
+        {"JNAF", -0.0038},
+        {"DDJH", +0.0012},
+    }, 7500, 320},
 
-    // TMX Sector A — ADF p=0.0003 (same 4 legs as NYSE; near-identical
-    // vector but TMX prices differ enough to give independent signal)
-    {"A_TMX", "TMX", {
-        {"NGUP", +0.0016},
-        {"KTST", +0.0003},
-        {"JZRO", -0.0032},
-        {"XFR",  +0.0154},
-    }, 7500, 280},
-
-    // NASDAQ Sector B — ADF p<0.0001 (KOTD/INA/HT/DLKV listed on NASDAQ)
+    // ─── NASDAQ ───────────────────────────────────────────────────
+    // B: 4-leg Johansen, ADF p<0.0001
     {"B_NASDAQ", "NASDAQ", {
-        {"KOTD", +0.0021},
-        {"INA",  -0.0051},
-        {"HT",   -0.0037},
-        {"DLKV", -0.0006},
+        {"KOTD", +0.0084},
+        {"INA",  -0.0200},
+        {"HT",   -0.0147},
+        {"DLKV", -0.0022},
     }, 7500, 280},
+
+    // ─── Euronext ─────────────────────────────────────────────────
+    // A: 3-leg EG (OIT on NGUP/JZRO), ADF p=0.0167
+    {"A_Euronext", "Euronext", {
+        {"NGUP", -0.0103},
+        {"OIT",  +0.0200},
+        {"JZRO", -0.0004},
+    }, 7500, 320},
+    // B: 4-leg EG (INA on KOTD/JNAF/DDJH), ADF p=0.0005
+    {"B_Euronext", "Euronext", {
+        {"KOTD", +0.0006},
+        {"INA",  +0.0200},
+        {"JNAF", -0.0040},
+        {"DDJH", +0.0016},
+    }, 7500, 280},
+
+    // ─── LSE ──────────────────────────────────────────────────────
+    // A: 3-leg EG (OIT on FSR/JZRO), ADF p=0.0278
+    {"A_LSE", "LSE", {
+        {"OIT",  +0.0154},
+        {"FSR",  -0.0200},
+        {"JZRO", +0.0050},
+    }, 7500, 320},
+    // B: 4-leg EG (HT on KOTD/DLKV/DDJH), ADF p=0.0086
+    {"B_LSE", "LSE", {
+        {"KOTD", -0.0065},
+        {"HT",   +0.0200},
+        {"DLKV", +0.0003},
+        {"DDJH", +0.0024},
+    }, 7500, 280},
+
+    // ─── HKEX ─────────────────────────────────────────────────────
+    // A: 3-leg EG (OIT on FSR/XFR), ADF p=0.0138
+    {"A_HKEX", "HKEX", {
+        {"OIT",  +0.0175},
+        {"FSR",  -0.0171},
+        {"XFR",  +0.0200},
+    }, 7500, 320},
+    // B: 4-leg EG (INA on KOTD/JNAF/DLKV), ADF p<0.0001
+    {"B_HKEX", "HKEX", {
+        {"KOTD", -0.0005},
+        {"INA",  +0.0200},
+        {"JNAF", -0.0027},
+        {"DLKV", +0.0001},
+    }, 7500, 280},
+
+    // ─── TMX ──────────────────────────────────────────────────────
+    // A: 4-leg Johansen (same legs as NYSE — independent prices), ADF p=0.0003
+    {"A_TMX", "TMX", {
+        {"NGUP", +0.0020},
+        {"KTST", +0.0004},
+        {"JZRO", -0.0042},
+        {"XFR",  +0.0200},
+    }, 7500, 280},
+    // B: 2-leg pair EG (DDJH vs HT), ADF p=0.0325
+    {"B_TMX", "TMX", {
+        {"HT",   +0.0048},
+        {"DDJH", +0.0200},
+    }, 7500, 320},
 };
 
 // ════════════════════════════════════════════════════════════════════
