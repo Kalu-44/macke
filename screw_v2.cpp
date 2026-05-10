@@ -1,8 +1,8 @@
 /*
  * SCREW BOT v2 — Volume-Weighted Mean Reversion (C++20)
- * Strategy: Track VWMA20 per asset. When VWMA20 > current_price,
+ * Strategy: Track VWMA20 per asset. When VWMA20 > current_price * (1+EDGE%),
  * sell aggressively and short. Maximize capital deployment.
- * Build: g++ -std=c++20 -O3 -march=native -o screw_v2 screw_v2.cpp -lpthread
+ * Build: g++ -std=c++20 -O2 -o screw_v2 screw_v2.cpp -lpthread
  */
 
 #include <algorithm>
@@ -16,7 +16,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -36,30 +35,26 @@ using tcp           = net::ip::tcp;
 using json          = nlohmann::json;
 
 // ════════════════════════════════════════════════════════════════════
-//  AGGRESSIVE PARAMS
+//  PARAMS
 // ════════════════════════════════════════════════════════════════════
 struct Params {
-    static constexpr int MAX_LONG    = 200;
-    static constexpr int MAX_SHORT   = -200;
-    static constexpr long CASH_FLOOR = -10'000'000;  // Allow -$100k in debt
-    
-    // EXTREME SPEED
-    static constexpr int STRAT_INTERVAL_MS  = 3;    // 3ms eval
-    static constexpr int INST_COOLDOWN_MS   = 5;    // 5ms cooldown
-    static constexpr int ORDER_TTL_MS       = 500;  // 0.5s TTL
-    
-    // MINIMAL WARMUP
-    static constexpr int WARMUP_MIN_MS     = 500;   // 0.5s only
-    static constexpr int WARMUP_MIN_VENUES = 3;     // 3 venues min
-    
-    // VWMA SETTINGS
-    static constexpr int VWMA_PERIOD = 20;           // 20-period
-    static constexpr int EDGE_PERCENT = 5;           // 5% above SMA = signal
-    
-    // AGGRESSIVE SIZING
-    static constexpr int BASE_SIZE = 150;            // 150 per order
-    static constexpr int AGGRESSIVE_MULTIPLIER = 2;  // 2x when short signal
+    static constexpr int  MAX_LONG    = 200;
+    static constexpr int  MAX_SHORT   = -200;
+    static constexpr long CASH_FLOOR  = -10'000'000;
+
+    static constexpr int INST_COOLDOWN_MS   = 25;
+    static constexpr int RATE_LIMIT_PER_SEC = 800;
+
+    static constexpr int WARMUP_MIN_MS     = 5'000;
+    static constexpr int WARMUP_MIN_VENUES = 3;
+
+    static constexpr int VWMA_PERIOD           = 20;
+    static constexpr int EDGE_PERCENT          = 5;
+    static constexpr int BASE_SIZE             = 50;
+    static constexpr int AGGRESSIVE_MULTIPLIER = 2;
 };
+
+static constexpr int EXCHANGE_PORT = 9001;
 
 static const std::vector<std::pair<std::string,std::string>> EXCHANGES = {
     {"NYSE","10.0.201.2"},   {"NASDAQ","10.0.202.2"}, {"SSE","10.0.203.2"},
@@ -71,22 +66,18 @@ static const std::vector<std::pair<std::string,std::string>> EXCHANGES = {
 static const std::vector<std::string> TARGET_ETFS = {"ETFA", "ETFB", "ETFA3", "ETFB3"};
 
 // ════════════════════════════════════════════════════════════════════
-//  Price with Volume (for VWMA calculation)
+//  Book & Market State
 // ════════════════════════════════════════════════════════════════════
 struct PricePoint {
-    double price;    // in cents
+    double  price;
     int64_t volume;
     int64_t ts_ms;
 };
 
-// ════════════════════════════════════════════════════════════════════
-//  Book & Market State
-// ════════════════════════════════════════════════════════════════════
 struct Book {
     std::map<int,int> bids, asks;
     int64_t ts_ms = 0;
-    int64_t last_volume = 0;  // cumulative volume
-    
+
     std::optional<int> best_bid() const {
         return bids.empty() ? std::nullopt : std::optional<int>(bids.rbegin()->first);
     }
@@ -99,85 +90,89 @@ struct Book {
     }
 };
 
+static int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 class MarketState {
-    std::map<std::string, std::map<std::string, Book>> books_;
-    std::map<std::string, std::map<std::string, std::deque<PricePoint>>> price_history_;
-    mutable std::mutex mtx_;
-    std::set<std::string> active_venues_;
-    int64_t warmup_start_ms_ = 0;
-    
 public:
     void update_book(const std::string& exch, const std::string& inst,
                      const json& bids, const json& asks, int64_t t) {
         std::lock_guard lk(mtx_);
-        active_venues_.insert(exch);
-        if (warmup_start_ms_ == 0) warmup_start_ms_ = t;
-        
         auto& b = books_[exch][inst];
-        b.ts_ms = t;
-        b.bids.clear(); b.asks.clear();
-        
+        b.ts_ms = t; b.bids.clear(); b.asks.clear();
         try {
             if (bids.is_object())
-                for (auto& [p, q] : bids.items())
+                for (auto& [p,q] : bids.items())
                     if (q.is_number()) b.bids[std::stoi(p)] = q.get<int>();
             if (asks.is_object())
-                for (auto& [p, q] : asks.items())
+                for (auto& [p,q] : asks.items())
                     if (q.is_number()) b.asks[std::stoi(p)] = q.get<int>();
         } catch (...) {}
-        
-        // Extract mid and volume, add to history
+
         if (auto mid = b.mid()) {
             int64_t vol = 0;
-            for (auto& [p, q] : b.asks) vol += q;
-            
+            for (auto& [p,q] : b.asks) vol += q;
             auto& hist = price_history_[exch][inst];
             hist.push_back({*mid, vol, t});
-            
-            // Keep only last 50 periods for VWMA20 + buffer
             if (hist.size() > 50) hist.pop_front();
         }
     }
-    
+
     std::optional<Book> get(const std::string& exch, const std::string& inst) const {
         std::lock_guard lk(mtx_);
         auto e = books_.find(exch); if (e == books_.end()) return std::nullopt;
         auto i = e->second.find(inst); if (i == e->second.end()) return std::nullopt;
         return i->second;
     }
-    
-    // Calculate Volume-Weighted Moving Average (VWMA)
+
     // VWMA = Σ(price_i * volume_i) / Σ(volume_i) for last N periods
-    std::optional<double> get_vwma(const std::string& exch, const std::string& inst, int periods = 20) const {
+    std::optional<double> get_vwma(const std::string& exch, const std::string& inst,
+                                    int periods = 20) const {
         std::lock_guard lk(mtx_);
-        auto eh = price_history_.find(exch);
-        if (eh == price_history_.end()) return std::nullopt;
-        auto ih = eh->second.find(inst);
-        if (ih == eh->second.end()) return std::nullopt;
-        
+        auto eh = price_history_.find(exch); if (eh == price_history_.end()) return std::nullopt;
+        auto ih = eh->second.find(inst);     if (ih == eh->second.end())     return std::nullopt;
         const auto& hist = ih->second;
-        if (hist.size() < periods) return std::nullopt;
-        
+        if ((int)hist.size() < periods) return std::nullopt;
         double sum_pv = 0, sum_v = 0;
-        size_t count = std::min(hist.size(), (size_t)periods);
-        
-        for (size_t i = hist.size() - count; i < hist.size(); ++i) {
+        for (size_t i = hist.size() - periods; i < hist.size(); ++i) {
             sum_pv += hist[i].price * hist[i].volume;
-            sum_v += hist[i].volume;
+            sum_v  += hist[i].volume;
         }
-        
         return sum_v > 0 ? std::optional<double>(sum_pv / sum_v) : std::nullopt;
     }
-    
-    bool is_warmed_up(int64_t now_ms) const {
-        std::lock_guard lk(mtx_);
-        return (now_ms - warmup_start_ms_ > Params::WARMUP_MIN_MS) &&
-               (active_venues_.size() >= Params::WARMUP_MIN_VENUES);
+
+    void note_venue_alive(const std::string& exch) {
+        std::lock_guard lk(warm_mtx_);
+        if (warmup_first_ms_ == 0) warmup_first_ms_ = now_ms();
+        warmup_venues_.insert(exch);
     }
+    bool warmup_done() const {
+        std::lock_guard lk(warm_mtx_);
+        if (warmup_first_ms_ == 0) return false;
+        if ((int)warmup_venues_.size() < Params::WARMUP_MIN_VENUES) return false;
+        return (now_ms() - warmup_first_ms_) >= Params::WARMUP_MIN_MS;
+    }
+    void reset_warmup() {
+        std::lock_guard lk(warm_mtx_);
+        warmup_venues_.clear();
+        warmup_first_ms_ = 0;
+    }
+
+private:
+    mutable std::mutex mtx_;
+    std::map<std::string, std::map<std::string, Book>> books_;
+    std::map<std::string, std::map<std::string, std::deque<PricePoint>>> price_history_;
+
+    mutable std::mutex warm_mtx_;
+    std::set<std::string> warmup_venues_;
+    int64_t warmup_first_ms_ = 0;
 };
 
 // ════════════════════════════════════════════════════════════════════
-//  Exchange Connection (sends orders)
+//  Exchange Connection — single WS per exchange, handles market data
+//  AND order responses on the same socket (same as prsbot)
 // ════════════════════════════════════════════════════════════════════
 class ExchangeConnection {
 public:
@@ -192,11 +187,10 @@ public:
             ioc_ = std::make_unique<net::io_context>();
             ws_  = std::make_unique<websocket::stream<tcp::socket>>(*ioc_);
             tcp::resolver r(*ioc_);
-            auto results = r.resolve(host_, "9001");
+            auto results = r.resolve(host_, std::to_string(EXCHANGE_PORT));
             net::connect(ws_->next_layer(), results);
-            ws_->handshake(host_+":9001", "/trade");
+            ws_->handshake(host_+":"+std::to_string(EXCHANGE_PORT), "/trade");
             connected_ = true;
-
             beast::flat_buffer buf;
             ws_->read(buf);  // welcome
             return true;
@@ -217,6 +211,16 @@ public:
 
     bool send(const json& msg) {
         if (!connected_) return false;
+        auto t = now_ms();
+        {
+            std::lock_guard lk(send_mtx_);
+            send_times_.erase(
+                std::remove_if(send_times_.begin(), send_times_.end(),
+                               [t](int64_t s){ return t - s > 1000; }),
+                send_times_.end());
+            if ((int)send_times_.size() >= Params::RATE_LIMIT_PER_SEC) return false;
+            send_times_.push_back(t);
+        }
         try {
             std::string text = msg.dump();
             std::lock_guard lk(write_mtx_);
@@ -236,33 +240,52 @@ public:
     std::string next_rid() { return name_+"-"+std::to_string(++rid_); }
 
     bool place_ioc(const std::string& inst, const std::string& side, int price, int qty) {
-        bool ok = send({
+        return send({
             {"type","add_order"}, {"user_request_id", next_rid()},
             {"instrument_id", inst}, {"price", price},
-            {"expiry", 0}, {"side", side},
+            {"expiry", now_ms()+1000}, {"side", side},
             {"quantity", qty}, {"order_type","ioc"},
         });
-        return ok;
     }
 
-    int position_of(const std::string& inst) const {
-        std::lock_guard lk(pos_mtx_);
-        auto it = positions_.find(inst);
-        return it == positions_.end() ? 0 : it->second;
+    bool get_inventory() {
+        return send({{"type","get_inventory"}, {"user_request_id", next_rid()}});
     }
 
-    long get_cash() const {
-        std::lock_guard lk(pos_mtx_);
-        return cash_cents_;
-    }
+    // Public for inventory/position access
+    std::mutex pos_mtx;
+    std::unordered_map<std::string,int> positions;
+    long cash_cents = 10'000'000;
 
-    void apply_response(const json& m) {
+    void apply_add_order_resp(const json& m) {
         if (!m.value("success", false)) return;
         if (!m.contains("data")) return;
         const auto& d = m["data"];
-        std::lock_guard lk(pos_mtx_);
+        std::lock_guard lk(pos_mtx);
         if (d.contains("immediate_balance_change") && !d["immediate_balance_change"].is_null())
-            cash_cents_ += d["immediate_balance_change"].get<long>();
+            cash_cents += d["immediate_balance_change"].get<long>();
+    }
+
+    void apply_inventory(const json& m) {
+        if (!m.contains("data")) return;
+        std::lock_guard lk(pos_mtx);
+        for (auto& [k, v] : m["data"].items()) {
+            if (!v.is_array() || v.size() < 2) continue;
+            if (k == "$") cash_cents = v[1].get<long>();
+            else positions[k] = v[1].get<int>();
+        }
+    }
+
+    int position_of(const std::string& inst) {
+        std::lock_guard lk(pos_mtx);
+        auto it = positions.find(inst);
+        return it == positions.end() ? 0 : it->second;
+    }
+
+    void on_segment_reset() {
+        std::lock_guard lk(pos_mtx);
+        positions.clear();
+        cash_cents = 10'000'000;
     }
 
 private:
@@ -271,261 +294,158 @@ private:
     std::unique_ptr<websocket::stream<tcp::socket>> ws_;
     std::atomic<bool> connected_{false};
     int rid_ = 0;
-    std::mutex write_mtx_;
-    
-    mutable std::mutex pos_mtx_;
-    std::unordered_map<std::string,int> positions_;
-    long cash_cents_ = 10'000'000;
+    std::mutex write_mtx_, send_mtx_;
+    std::vector<int64_t> send_times_;
 };
 
 // ════════════════════════════════════════════════════════════════════
-//  Position & Cash Tracker
-// ════════════════════════════════════════════════════════════════════
-class Positions {
-    std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& conns_;
-    mutable std::mutex mtx_;
-    
-public:
-    Positions(std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& c)
-        : conns_(c) {}
-    
-    int get_position(const std::string& ticker) const {
-        // Sum across all exchanges
-        int total = 0;
-        for (auto& [_, conn] : conns_) {
-            total += conn->position_of(ticker);
-        }
-        return total;
-    }
-    
-    long get_total_cash() const {
-        long total = 0;
-        for (auto& [_, conn] : conns_) {
-            total += conn->get_cash();
-        }
-        return total;
-    }
-    
-    void print_status() const {
-        std::cout << "\n=== PORTFOLIO ===\n";
-        std::cout << "Total Cash: $" << (get_total_cash() / 100.0) << "\n";
-        for (auto& [ticker, _] : conns_) {
-            int pos = get_position(ticker);
-            if (pos != 0) {
-                std::cout << ticker << ": " << pos << "\n";
-            }
-        }
-    }
-};
-
-// ════════════════════════════════════════════════════════════════════
-//  WebSocket Listener
-// ════════════════════════════════════════════════════════════════════
-class ExchangeListener {
-    std::string exchange_;
-    MarketState& mkt_;
-    std::atomic<bool> running_{false};
-    std::thread listener_thread_;
-    
-    void run_listener() {
-        try {
-            auto host_it = std::find_if(EXCHANGES.begin(), EXCHANGES.end(),
-                [this](const auto& p) { return p.first == exchange_; });
-            if (host_it == EXCHANGES.end()) return;
-            
-            auto ioc = std::make_unique<net::io_context>();
-            auto ws = std::make_unique<websocket::stream<tcp::socket>>(*ioc);
-            
-            tcp::resolver r(*ioc);
-            auto results = r.resolve(host_it->second, "9001");
-            net::connect(ws->next_layer(), results);
-            
-            ws->handshake(host_it->second + ":9001", "/trade");
-            
-            beast::flat_buffer welcome_buf;
-            ws->read(welcome_buf);
-            
-            while (running_) {
-                try {
-                    beast::flat_buffer buffer;
-                    ws->read(buffer);
-                    auto str = beast::buffers_to_string(buffer.data());
-                    auto msg = json::parse(str);
-                    
-                    if (msg.contains("instrument") && msg.contains("bids") && msg.contains("asks")) {
-                        mkt_.update_book(exchange_, msg["instrument"].get<std::string>(),
-                                        msg["bids"], msg["asks"], 
-                                        std::chrono::system_clock::now().time_since_epoch().count() / 1'000'000);
-                    }
-                } catch (...) {}
-            }
-            ws->close(websocket::close_code::normal);
-        } catch (const std::exception& e) {
-            std::cerr << "[" << exchange_ << "] listener error: " << e.what() << "\n";
-        }
-    }
-    
-public:
-    ExchangeListener(const std::string& exch, MarketState& mkt)
-        : exchange_(exch), mkt_(mkt) {
-        running_ = true;
-        listener_thread_ = std::thread(&ExchangeListener::run_listener, this);
-    }
-    
-    ~ExchangeListener() {
-        running_ = false;
-        if (listener_thread_.joinable()) listener_thread_.join();
-    }
-};
-
-// ════════════════════════════════════════════════════════════════════
-//  Trading Logic
+//  Trader — VWMA20 strategy, evaluated per-exchange on every tick
 // ════════════════════════════════════════════════════════════════════
 class Trader {
-    MarketState& mkt_;
-    Positions& pos_;
-    std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& conns_;
-    std::map<std::string, int64_t> last_trade_time_;
-    std::mutex trade_mtx_;
-    
 public:
-    Trader(MarketState& mkt, Positions& pos, 
-           std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& c)
-        : mkt_(mkt), pos_(pos), conns_(c) {}
-    
-    void evaluate_asset(const std::string& etf) {
-        std::lock_guard lk(trade_mtx_);
-        int64_t now = std::chrono::system_clock::now().time_since_epoch().count() / 1'000'000;
-        
-        // Cooldown
-        auto it = last_trade_time_.find(etf);
-        if (it != last_trade_time_.end() && now - it->second < Params::INST_COOLDOWN_MS)
-            return;
-        
-        // Collect prices and VWMA from all venues
-        std::vector<std::pair<std::string, double>> current_prices;
-        std::vector<std::pair<std::string, double>> vwmas;
-        
-        for (auto& [exch, _] : EXCHANGES) {
-            auto book = mkt_.get(exch, etf);
+    Trader(MarketState& mkt,
+           std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& conns)
+        : mkt_(mkt), conns_(conns) {}
+
+    void evaluate(const std::string& exch) {
+        if (!mkt_.warmup_done()) return;
+
+        auto& conn = *conns_.at(exch);
+        int64_t now = now_ms();
+
+        for (const auto& etf : TARGET_ETFS) {
+            // Instruments are stored as "EXCHANGE-TICKER" (e.g. "ZSE-ETFA")
+            std::string inst   = exch + "-" + etf;
+            std::string cd_key = exch + "|" + etf;
+
+            {
+                std::lock_guard lk(cd_mtx_);
+                auto it = last_trade_ms_.find(cd_key);
+                if (it != last_trade_ms_.end() && now - it->second < Params::INST_COOLDOWN_MS)
+                    continue;
+            }
+
+            auto book = mkt_.get(exch, inst);
             if (!book || !book->mid()) continue;
-            
-            auto vwma = mkt_.get_vwma(exch, etf, Params::VWMA_PERIOD);
+
+            auto vwma = mkt_.get_vwma(exch, inst, Params::VWMA_PERIOD);
             if (!vwma) continue;
-            
-            current_prices.push_back({exch, *book->mid()});
-            vwmas.push_back({exch, *vwma});
-        }
-        
-        if (current_prices.empty() || vwmas.empty()) return;
-        
-        // Calculate average current price and average VWMA
-        double avg_price = 0, avg_vwma = 0;
-        for (auto& [_, p] : current_prices) avg_price += p;
-        for (auto& [_, v] : vwmas) avg_vwma += v;
-        avg_price /= current_prices.size();
-        avg_vwma /= vwmas.size();
-        
-        // SIGNAL: If VWMA > current_price by EDGE%, SELL AGGRESSIVELY + SHORT
-        double threshold = avg_price * (1.0 + Params::EDGE_PERCENT / 100.0);
-        
-        if (avg_vwma > threshold) {
-            std::cout << "[SIGNAL] " << etf 
-                      << " VWMA=" << (avg_vwma/100.0) 
-                      << " > Price=" << (avg_price/100.0) 
-                      << " (threshold=" << (threshold/100.0) << ") → SELL/SHORT\n";
-            
-            int current_pos = pos_.get_position(etf);
-            int avg_price_int = (int)avg_price;
-            
-            // Sell from existing position
-            if (current_pos > 0) {
-                int sell_qty = std::min(current_pos, Params::BASE_SIZE * Params::AGGRESSIVE_MULTIPLIER);
-                for (auto& [exch, conn] : conns_) {
-                    if (conn && conn->connected()) {
-                        bool ok = conn->place_ioc(etf, "sell", avg_price_int, sell_qty / 10);
-                        if (ok) std::cout << "  ├─ SELL order sent to " << exch << "\n";
-                    }
+
+            double price     = *book->mid();
+            double threshold = price * (1.0 + Params::EDGE_PERCENT / 100.0);
+
+            if (*vwma > threshold) {
+                auto bid = book->best_bid();
+                if (!bid) continue;
+
+                int pos = conn.position_of(inst);
+                std::cout << "[SIGNAL] " << exch << " " << etf
+                          << " VWMA=" << (*vwma / 100.0)
+                          << " Price=" << (price / 100.0)
+                          << " pos=" << pos << " → SELL/SHORT\n";
+
+                // Liquidate any long first
+                if (pos > 0) {
+                    int qty = std::min(pos, Params::BASE_SIZE * Params::AGGRESSIVE_MULTIPLIER);
+                    if (qty > 0) conn.place_ioc(inst, "ask", *bid, qty);
+                }
+
+                // Go short if headroom remains
+                if (pos > Params::MAX_SHORT) {
+                    int qty = std::min(Params::BASE_SIZE, pos - Params::MAX_SHORT);
+                    if (qty > 0) conn.place_ioc(inst, "ask", *bid, qty);
                 }
             }
-            
-            // SHORT aggressively
-            if (current_pos >= Params::MAX_SHORT) {
-                int short_qty = Params::BASE_SIZE * Params::AGGRESSIVE_MULTIPLIER;
-                for (auto& [exch, conn] : conns_) {
-                    if (conn && conn->connected()) {
-                        bool ok = conn->place_ioc(etf, "sell", avg_price_int, short_qty / 10);
-                        if (ok) std::cout << "  └─ SHORT order sent to " << exch << "\n";
-                    }
-                }
+
+            {
+                std::lock_guard lk(cd_mtx_);
+                last_trade_ms_[cd_key] = now;
             }
         }
-        
-        last_trade_time_[etf] = now;
     }
+
+private:
+    MarketState& mkt_;
+    std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>>& conns_;
+    std::mutex cd_mtx_;
+    std::unordered_map<std::string, int64_t> last_trade_ms_;
 };
 
 // ════════════════════════════════════════════════════════════════════
-//  Main
+//  Main — one thread per exchange, single connection handles all msgs
 // ════════════════════════════════════════════════════════════════════
 int main() {
     std::cout << "SCREW BOT v2 — Volume-Weighted Mean Reversion\n";
-    std::cout << "Monitoring: " << TARGET_ETFS.size() << " ETFs across all venues\n";
-    std::cout << "Strategy: VWMA20 > Current Price → Aggressive Sell/Short\n\n";
-    
+    std::cout << "Monitoring " << TARGET_ETFS.size() << " ETFs across "
+              << EXCHANGES.size() << " venues\n\n";
+
     MarketState mkt;
-    
-    // Create exchange connections for SENDING orders
     std::unordered_map<std::string, std::unique_ptr<ExchangeConnection>> conns;
-    for (auto& [name, host] : EXCHANGES) {
-        auto conn = std::make_unique<ExchangeConnection>(name, host);
-        if (conn->connect()) {
-            std::cout << "Connected to " << name << " (order channel)\n";
-            conns[name] = std::move(conn);
-        }
-    }
-    
-    Positions pos(conns);
-    Trader trader(mkt, pos, conns);
-    
-    // Start listeners for MARKET DATA
-    std::vector<std::unique_ptr<ExchangeListener>> listeners;
+    for (auto& [name, host] : EXCHANGES)
+        conns.emplace(name, std::make_unique<ExchangeConnection>(name, host));
+
+    Trader trader(mkt, conns);
+    std::atomic<bool> running{true};
+    std::vector<std::thread> threads;
+
+    // One thread per exchange — reads market data + order responses on same socket
     for (auto& [name, _] : EXCHANGES) {
-        listeners.push_back(std::make_unique<ExchangeListener>(name, mkt));
-        std::cout << "Listening to " << name << " (market data)\n";
+        threads.emplace_back([&, exch = name]() {
+            auto& conn = *conns.at(exch);
+            int backoff = 1;
+            while (running) {
+                if (!conn.connect()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                    backoff = std::min(backoff * 2, 8);
+                    continue;
+                }
+                backoff = 1;
+                conn.on_segment_reset();
+                mkt.reset_warmup();
+                std::cout << "[" << exch << "] connected\n";
+
+                while (running && conn.connected()) {
+                    auto m = conn.recv();
+                    if (!m) break;
+
+                    auto type = m->value("type", "");
+                    if (type == "market_data_update") {
+                        int64_t srv_t = m->value("time", (int64_t)0);
+                        if (m->contains("orderbook_depths")) {
+                            for (auto& [inst, ob] : (*m)["orderbook_depths"].items())
+                                mkt.update_book(exch, inst,
+                                               ob.value("bids", json::object()),
+                                               ob.value("asks", json::object()), srv_t);
+                        }
+                        mkt.note_venue_alive(exch);
+                        trader.evaluate(exch);
+                    } else if (type == "add_order_response") {
+                        conn.apply_add_order_resp(*m);
+                    } else if (type == "get_inventory_response") {
+                        conn.apply_inventory(*m);
+                    } else if (type == "end_of_round") {
+                        std::cout << "[" << exch << "] end_of_round; reconnecting\n";
+                        break;
+                    } else if (type == "error") {
+                        std::cerr << "[" << exch << "] error: " << m->value("message","") << "\n";
+                    }
+                }
+
+                conn.disconnect();
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+        });
     }
-    
-    // Wait for warmup
-    std::cout << "\nWarmup phase...\n";
-    int warmup_count = 0;
-    while (!mkt.is_warmed_up(std::chrono::system_clock::now().time_since_epoch().count() / 1'000'000)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (++warmup_count % 10 == 0) std::cout << ".";
-    }
-    std::cout << "\nWarmup complete. Starting trading...\n\n";
-    
-    // Trading loop
-    auto last_eval = std::chrono::system_clock::now();
-    int eval_count = 0;
-    
-    while (true) {
-        auto now = std::chrono::system_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_eval).count() < Params::STRAT_INTERVAL_MS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+
+    // Periodic inventory sync so position tracking stays accurate
+    threads.emplace_back([&]() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            for (auto& [_, conn] : conns)
+                if (conn->connected()) conn->get_inventory();
         }
-        last_eval = now;
-        
-        // Evaluate all ETFs
-        for (const auto& etf : TARGET_ETFS) {
-            trader.evaluate_asset(etf);
-        }
-        
-        // Print status every 100 evals
-        if (++eval_count % 100 == 0) {
-            pos.print_status();
-        }
-    }
-    
+    });
+
+    for (auto& t : threads) t.join();
     return 0;
 }
