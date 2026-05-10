@@ -155,29 +155,32 @@ class ExchangeListener {
     std::thread listener_thread_;
     
     void run_listener() {
-        using resolver = net::ip::tcp::resolver;
-        net::io_context ioc;
-        
         try {
             auto host_it = std::find_if(EXCHANGES.begin(), EXCHANGES.end(),
                 [this](const auto& p) { return p.first == exchange_; });
             if (host_it == EXCHANGES.end()) return;
             
-            tcp::socket sock(ioc);
-            resolver res(ioc);
-            net::connect(sock, res.resolve(host_it->second, "9001"));
+            auto ioc = std::make_unique<net::io_context>();
+            auto ws = std::make_unique<websocket::stream<tcp::socket>>(*ioc);
             
-            websocket::stream<tcp::socket&> ws(sock);
-            ws.handshake(host_it->second, "/");
+            tcp::resolver r(*ioc);
+            auto results = r.resolve(host_it->second, "9001");
+            net::connect(ws->next_layer(), results);
             
-            std::string buf(8192, 0);
+            // Handshake with correct path and host:port format
+            ws->handshake(host_it->second + ":9001", "/trade");
+            
+            // Read welcome message
+            beast::flat_buffer welcome_buf;
+            ws->read(welcome_buf);
+            
             while (running_) {
-                beast::flat_buffer buffer;
-                ws.read(buffer);
-                auto data = buffer.data();
                 try {
-                    auto msg = json::parse(std::string_view(
-                        static_cast<const char*>(data.data()), data.size()));
+                    beast::flat_buffer buffer;
+                    ws->read(buffer);
+                    auto str = beast::buffers_to_string(buffer.data());
+                    auto msg = json::parse(str);
+                    
                     if (msg.contains("instrument") && msg.contains("bids") && msg.contains("asks")) {
                         mkt_.update_book(exchange_, msg["instrument"].get<std::string>(),
                                         msg["bids"], msg["asks"], 
@@ -185,7 +188,7 @@ class ExchangeListener {
                     }
                 } catch (...) {}
             }
-            ws.close(websocket::close_code::normal);
+            ws->close(websocket::close_code::normal);
         } catch (const std::exception& e) {
             std::cerr << "[" << exchange_ << "] listener error: " << e.what() << "\n";
         }
