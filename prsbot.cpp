@@ -50,8 +50,8 @@ using json          = nlohmann::json;
 // ════════════════════════════════════════════════════════════════════
 struct Params {
     // Risk caps — match exchange floors (-200 pos, -$50k cash)
-    static constexpr int  MAX_LONG    = 200;
-    static constexpr int  MAX_SHORT   = -200;
+    static constexpr int  MAX_LONG    = 1000;
+    static constexpr int  MAX_SHORT   = -1000;
     static constexpr long CASH_FLOOR  = -5'000'000;   // cents = -$50k
 
     static constexpr int  ORDER_TTL_MS         = 4'000;
@@ -63,7 +63,7 @@ struct Params {
     static constexpr int  WARMUP_MIN_VENUES = 7;
 
     // Per-instrument cooldown after sending an order
-    static constexpr int  INST_COOLDOWN_MS = 75;
+    static constexpr int  INST_COOLDOWN_MS = 25;
 
     // ─── ETF arbitrage (hedged: ETF mispriced vs constituents) ──────
     // Trade when |ETF_mid - mean(constituent_mids)| ≥ EDGE on a venue
