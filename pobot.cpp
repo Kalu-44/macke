@@ -69,8 +69,8 @@ struct Params {
     // where ALL constituents are listed (full local hedge → no drift risk).
     static constexpr int  ETF_EDGE_CENTS    = 20;    // entry threshold
     static constexpr int  ETF_EXIT_CENTS    = 5;     // unwind when mispricing collapses
-    static constexpr int  ETF_MAX_K    = 20;     // base hedge size
-    static constexpr int  ETF_POS_CAP       = 60;    // max ETF qty per (etf, venue)
+    static constexpr int  ETF_MAX_K    = 50;     // base hedge size
+    static constexpr int  ETF_POS_CAP       = 150;    // max ETF qty per (etf, venue)
     static constexpr int  ETF_COOLDOWN_MS   = 250;   // per (etf, venue)
 
     // ─── Safe-haven spread (market index + ETFSH ≈ 200) ─────────────
@@ -105,7 +105,7 @@ struct Params {
     static constexpr int  SECPAIR_STOP_Z100        = 600;
     static constexpr int  SECPAIR_STOP_COOLDOWN_MS = 30'000;
     static constexpr int  SECPAIR_REBAL_MS         = 250;
-    static constexpr int  SECPAIR_POS_CAP          = 30;    // per ticker per venue
+    static constexpr int  SECPAIR_POS_CAP          = 150;    // per ticker per venue
 
     // ─── Cross-venue same-ticker arbitrage (global scan) ────────────
     // Every tick, for each ticker observed on ≥2 venues, find venue with
