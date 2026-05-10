@@ -89,10 +89,10 @@ struct Params {
     // Switches
     // Proven (math-defined or structural edge): ON
     static constexpr bool ENABLE_ETF_ARB    = true;
-    static constexpr bool ENABLE_XVENUE_ARB = false;
-    static constexpr bool ENABLE_STALE_ARB  = false;
-    static constexpr bool ENABLE_MM         = false;
-    static constexpr bool ENABLE_UNWIND     = false;   // close positions near segment end
+    static constexpr bool ENABLE_XVENUE_ARB = true;
+    static constexpr bool ENABLE_STALE_ARB  = true;
+    static constexpr bool ENABLE_MM         = true;
+    static constexpr bool ENABLE_UNWIND     = true;   // close positions near segment end
     // Confirmed by training-round analysis (analyze2.py on ./podaci):
     //   SIMP: VR(8)=0.25, AC1=-0.43, Hurst=0.29 → strong mean-reversion to ~$99.92
     //   XFR : VR(8)=0.27, AC1=-0.42, Hurst=0.33 → strong mean-reversion
@@ -228,7 +228,7 @@ static int arb_size_for(const std::string& etf) {
     if (etf == "ETFA3") return 20;  // ← std=28c, isto kao ETFB
     return Params::ARB_SIZE;        // ETFA: std=13c, najstabilniji
 }
-
+}
 static int etf_edge_for(const std::string& etf) {
     if (etf == "ETFB3") return 50;   // big bias, big std
     if (etf == "ETFB")  return 20;
@@ -700,9 +700,9 @@ void Strategy::etf_arb(const std::string& exch) {
 
         auto bk_mid = bk->mid();
         if (bk_mid) state_.record_gap(etf, *bk_mid, *nav);
-        int dyn_edge = state_.gap_std(etf).transform(  []  (double s){  return (int)(1.5 * s); } )
-               .value_or(edge);              // fallback na konstantu dok se ne nakupi istorija
-        dyn_edge = std::max(dyn_edge, edge);     
+        auto gap_s = state_.gap_std(etf);
+        int dyn_edge = gap_s ? std::max(edge, (int)(1.5 * *gap_s)) : edge;             // fallback na konstantu dok se ne nakupi istorija
+           
 
         if (bk->best_bid() && (*bk->best_bid() - *nav) >= dyn_edge) {
             // ↓↓↓ IZMENA — bilo: Params::ARB_SIZE
