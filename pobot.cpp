@@ -69,7 +69,7 @@ struct Params {
     // where ALL constituents are listed (full local hedge → no drift risk).
     static constexpr int  ETF_EDGE_CENTS    = 20;    // entry threshold
     static constexpr int  ETF_EXIT_CENTS    = 5;     // unwind when mispricing collapses
-    static constexpr int  ETF_HEDGE_UNIT    = 1;     // base hedge size
+    static constexpr int  ETF_MAX_K    = 20;     // base hedge size
     static constexpr int  ETF_POS_CAP       = 60;    // max ETF qty per (etf, venue)
     static constexpr int  ETF_COOLDOWN_MS   = 250;   // per (etf, venue)
 
