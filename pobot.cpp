@@ -48,30 +48,30 @@ using json          = nlohmann::json;
 //  Params
 // ════════════════════════════════════════════════════════════════════
 struct Params {
-    // Risk caps
-    static constexpr int  MAX_LONG    = 150;
-    static constexpr int  MAX_SHORT   = -150;
-    static constexpr long CASH_FLOOR  = -3'000'000;   // cents
+    // Risk caps — match exchange floors (-200 pos, -$50k cash)
+    static constexpr int  MAX_LONG    = 200;
+    static constexpr int  MAX_SHORT   = -200;
+    static constexpr long CASH_FLOOR  = -5'000'000;   // cents = -$50k
 
     static constexpr int  ORDER_TTL_MS         = 4'000;
-    static constexpr int  STRAT_MIN_INTERVAL_MS = 50;
-    static constexpr int  RATE_LIMIT_PER_SEC    = 400;
+    static constexpr int  STRAT_MIN_INTERVAL_MS = 25;
+    static constexpr int  RATE_LIMIT_PER_SEC    = 800;
 
     // Warmup gate (after each (re)connect)
     static constexpr int  WARMUP_MIN_MS     = 10'000;
     static constexpr int  WARMUP_MIN_VENUES = 7;
 
     // Per-instrument cooldown after sending an order
-    static constexpr int  INST_COOLDOWN_MS = 250;
+    static constexpr int  INST_COOLDOWN_MS = 75;
 
     // ─── ETF arbitrage (hedged: ETF mispriced vs constituents) ──────
     // Trade when |ETF_mid - mean(constituent_mids)| ≥ EDGE on a venue
     // where ALL constituents are listed (full local hedge → no drift risk).
-    static constexpr int  ETF_EDGE_CENTS    = 20;    // entry threshold
+    static constexpr int  ETF_EDGE_CENTS    = 15;    // entry threshold
     static constexpr int  ETF_EXIT_CENTS    = 5;     // unwind when mispricing collapses
-    static constexpr int  ETF_MAX_K    = 50;     // base hedge size
-    static constexpr int  ETF_POS_CAP       = 150;    // max ETF qty per (etf, venue)
-    static constexpr int  ETF_COOLDOWN_MS   = 250;   // per (etf, venue)
+    static constexpr int  ETF_MAX_K         = 66;    // hard cap on hedge unit per fire (~200/3)
+    static constexpr int  ETF_POS_CAP       = 200;   // max ETF qty per (etf, venue)
+    static constexpr int  ETF_COOLDOWN_MS   = 100;   // per (etf, venue)
 
     // ─── Safe-haven spread (market index + ETFSH ≈ 200) ─────────────
     // Per guide: safe-haven (GOLD/XAG → ETFSH) inversely correlated with
@@ -105,7 +105,7 @@ struct Params {
     static constexpr int  SECPAIR_STOP_Z100        = 600;
     static constexpr int  SECPAIR_STOP_COOLDOWN_MS = 30'000;
     static constexpr int  SECPAIR_REBAL_MS         = 250;
-    static constexpr int  SECPAIR_POS_CAP          = 150;    // per ticker per venue
+    static constexpr int  SECPAIR_POS_CAP          = 200;   // per ticker per venue
 
     // ─── Cross-venue same-ticker arbitrage (global scan) ────────────
     // Every tick, for each ticker observed on ≥2 venues, find venue with
@@ -113,9 +113,9 @@ struct Params {
     // bid - ask >= edge, fire paired IOC. No transaction fees, so edge=1c
     // is pure positive EV. Cooldown is per ticker (global, not per pair).
     static constexpr int  XVENUE_EDGE_CENTS    = 1;
-    static constexpr int  XVENUE_SIZE          = 50;
-    static constexpr int  XVENUE_POS_CAP       = 150;
-    static constexpr int  XVENUE_COOLDOWN_MS   = 100; // per ticker
+    static constexpr int  XVENUE_SIZE          = 200;  // no per-fire cap; let book qty + headroom decide
+    static constexpr int  XVENUE_POS_CAP       = 200;
+    static constexpr int  XVENUE_COOLDOWN_MS   = 40;   // per ticker
 };
 
 // ════════════════════════════════════════════════════════════════════
