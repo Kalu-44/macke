@@ -116,7 +116,7 @@ struct Params {
     // bid - ask >= edge, fire paired IOC. No transaction fees, so edge=1c
     // is pure positive EV. Cooldown is per ticker (global, not per pair).
     static constexpr int  XVENUE_EDGE_CENTS    = 1;
-    static constexpr int  XVENUE_SIZE          = 500;  // per-fire cap; book qty + headroom decide
+    static constexpr int  XVENUE_SIZE          = 1000;  // per-fire cap; book qty + headroom decide
     static constexpr int  XVENUE_POS_CAP       = 1500; // long cap (short side limited by MAX_SHORT)
     static constexpr int  XVENUE_COOLDOWN_MS   = 20;   // per ticker
 
