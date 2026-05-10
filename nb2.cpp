@@ -118,7 +118,7 @@ struct Params {
     static constexpr int  XVENUE_EDGE_CENTS    = 1;
     static constexpr int  XVENUE_SIZE          = 500;  // per-fire cap; book qty + headroom decide
     static constexpr int  XVENUE_POS_CAP       = 1500; // long cap (short side limited by MAX_SHORT)
-    static constexpr int  XVENUE_COOLDOWN_MS   = 40;   // per ticker
+    static constexpr int  XVENUE_COOLDOWN_MS   = 20;   // per ticker
 
     // ─── ETF-pair basis arb (ETFA ↔ ETFA3, ETFB ↔ ETFB3 same-venue) ───
     // basis = ETF3_mid - ratio*ETF_mid (ratio=3 because subset basket of 3
