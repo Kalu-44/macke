@@ -228,7 +228,7 @@ static int arb_size_for(const std::string& etf) {
     if (etf == "ETFA3") return 20;  // ← std=28c, isto kao ETFB
     return Params::ARB_SIZE;        // ETFA: std=13c, najstabilniji
 }
-}
+
 static int etf_edge_for(const std::string& etf) {
     if (etf == "ETFB3") return 50;   // big bias, big std
     if (etf == "ETFB")  return 20;
